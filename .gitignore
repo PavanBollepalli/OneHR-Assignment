@@ -1,0 +1,17 @@
+# Secrets / local config
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Data dumps / local scratch
+*.bson
+dump/
