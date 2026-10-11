@@ -21,14 +21,16 @@ Design notes
 from __future__ import annotations
 
 import calendar
+import json
 import os
 from contextlib import asynccontextmanager
 from datetime import date as date_cls
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from enum import Enum
-from typing import Annotated, Optional
+from typing import Annotated, Literal, Optional
 
+from bson import json_util
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Path, Query
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -463,16 +465,14 @@ def punch_in(body: PunchInIn):
     return serialize_record(doc)
 
 
-@app.get("/attendance", tags=["attendance"])
-def list_attendance(
-    emp_code: Optional[str] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    status: Optional[Status] = None,
-    page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
-):
-    """Filtered, paginated attendance, sorted by date desc then emp_code asc (R10)."""
+def build_attendance_query(
+    emp_code: Optional[str],
+    date_from: Optional[str],
+    date_to: Optional[str],
+    status: Optional[Status],
+) -> dict:
+    """Validate + build the GET /attendance filter. Shared with /admin/explain
+    so the explained query is byte-identical to the one actually served."""
     for label, value in (("date_from", date_from), ("date_to", date_to)):
         if value is not None:
             try:
@@ -494,7 +494,20 @@ def list_attendance(
         query["date"] = date_range
     if status:
         query["status"] = status.value
+    return query
 
+
+@app.get("/attendance", tags=["attendance"])
+def list_attendance(
+    emp_code: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status: Optional[Status] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    """Filtered, paginated attendance, sorted by date desc then emp_code asc (R10)."""
+    query = build_attendance_query(emp_code, date_from, date_to, status)
     total = logs_col.count_documents(query)
     cursor = (
         logs_col.find(query)
@@ -772,11 +785,37 @@ def build_employee_monthly_pipeline(emp_code: str, month: str) -> list[dict]:
     ]
 
 
-def build_department_summary_pipeline(month: str, department: Optional[str]) -> list[dict]:
-    """Logs side of the department summary: metrics grouped by the employee's department."""
+def department_emp_codes(department: Optional[str]) -> Optional[list[str]]:
+    """``emp_code`` list of every employee in ``department`` (``None`` -> no filter).
+
+    Pushes the department filter onto the indexed date match of the summary pipeline
+    (``{emp_code, date}``); a log whose employee is not in the list cannot join an
+    employee of the requested department, so the groups are unchanged. Shared by the
+    summary endpoint and its explain."""
+    if not department:
+        return None
+    return [
+        e["emp_code"]
+        for e in employees_col.find({"department": department}, {"_id": 0, "emp_code": 1})
+    ]
+
+
+def build_department_summary_pipeline(
+    month: str, department: Optional[str], department_names: Optional[list[str]] = None
+) -> list[dict]:
+    """Logs side of the department summary: metrics grouped by the employee's department.
+
+    ``department_names`` pushes the department filter onto the leading ``date`` match
+    as an ``emp_code`` ``$in``, which the ``{emp_code, date}`` index can serve without
+    scanning the whole month; the resulting groups are identical to filtering after
+    the lookup.
+    """
     lo, hi = month_bounds(month)
+    first_match: dict = {"date": {"$gte": lo, "$lte": hi}}
+    if department_names is not None:
+        first_match["emp_code"] = {"$in": list(department_names)}
     pipeline: list[dict] = [
-        {"$match": {"date": {"$gte": lo, "$lte": hi}}},
+        {"$match": first_match},
         {
             "$lookup": {
                 "from": "employees",
@@ -1016,17 +1055,17 @@ def department_summary(month: MonthQuery, department: Optional[str] = None):
     emp_query: dict = {"joined_on": {"$lte": month_end}}
     if department:
         emp_query["department"] = department
-    headcounts = {
-        d["_id"]: d["headcount"]
-        for d in employees_col.aggregate(
-            [{"$match": emp_query}, {"$group": {"_id": "$department", "headcount": {"$sum": 1}}}]
-        )
-    }
+    emp_docs = list(employees_col.find(emp_query, {"_id": 0, "department": 1, "emp_code": 1}))
+    headcounts: dict = {}
+    for e in emp_docs:
+        headcounts[e["department"]] = headcounts.get(e["department"], 0) + 1
+    dept_names = department_emp_codes(department)
 
     metrics = {
         d["_id"]: d
         for d in logs_col.aggregate(
-            build_department_summary_pipeline(month, department), allowDiskUse=True
+            build_department_summary_pipeline(month, department, department_names=dept_names),
+            allowDiskUse=True,
         )
     }
 
@@ -1101,3 +1140,133 @@ def department_trend(
 # --------------------------------------------------------------------------- #
 # Admin
 # --------------------------------------------------------------------------- #
+ExplainEndpoint = Literal[
+    "attendance_list",
+    "employee_monthly",
+    "department_summary",
+    "late_leaderboard",
+    "department_trend",
+]
+
+EXPLAIN_COLLECTION = {
+    "attendance_list": "attendance_logs",
+    "employee_monthly": "attendance_logs",
+    "department_summary": "attendance_logs",
+    "late_leaderboard": "attendance_logs",
+    "department_trend": "attendance_logs",
+}
+
+
+def _explain_doc(raw: dict) -> dict:
+    """Convert an explain document to plain JSON (BSON types -> extended JSON)."""
+    return json.loads(json_util.dumps(raw))
+
+
+def _run_explain(command: dict) -> dict:
+    """Run an ``explain`` at ``executionStats`` verbosity and return the raw document.
+
+    ``Cursor.explain()`` would default to ``allPlansExecution``; the contract asks for
+    ``executionStats``, so the command is issued directly.
+    """
+    return db.command(command, verbosity="executionStats")
+
+
+@app.get("/admin/explain/{endpoint}", tags=["admin"])
+def explain_endpoint(
+    endpoint: ExplainEndpoint,
+    emp_code: Optional[str] = None,
+    month: Optional[str] = None,
+    department: Optional[str] = None,
+    status: Optional[Status] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    limit: int = Query(10, ge=1, le=50),
+    date_from_alias: Optional[str] = Query(None, alias="from"),
+    date_to_alias: Optional[str] = Query(None, alias="to"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    """Raw ``executionStats`` explain for the query the named endpoint really runs.
+
+    The filter/pipeline is produced by the *same* builder the endpoint uses, so the
+    plan shown here is byte-identical to the plan the endpoint executes.
+    """
+    # The trend endpoint spells its range params ``from``/``to``; accept either name.
+    range_from = date_from_alias or date_from
+    range_to = date_to_alias or date_to
+
+    def require(name: str, value):
+        if value is None:
+            raise HTTPException(status_code=422, detail=f"{name} is required for {endpoint}")
+        return value
+
+    if endpoint == "attendance_list":
+        query = build_attendance_query(emp_code, range_from, range_to, status)
+        command = {
+            "explain": {
+                "find": "attendance_logs",
+                "filter": query,
+                "sort": {"date": -1, "emp_code": 1},
+                "skip": (page - 1) * page_size,
+                "limit": page_size,
+            }
+        }
+    elif endpoint == "employee_monthly":
+        emp_code = require("emp_code", emp_code)
+        month = require("month", month)
+        command = {
+            "explain": {
+                "aggregate": "attendance_logs",
+                "pipeline": build_employee_monthly_pipeline(emp_code, month),
+                "cursor": {},
+            }
+        }
+    elif endpoint == "department_summary":
+        month = require("month", month)
+        command = {
+            "explain": {
+                "aggregate": "attendance_logs",
+                "pipeline": build_department_summary_pipeline(
+                    month, department, department_names=department_emp_codes(department)
+                ),
+                "cursor": {},
+            }
+        }
+    elif endpoint == "late_leaderboard":
+        month = require("month", month)
+        command = {
+            "explain": {
+                "aggregate": "attendance_logs",
+                "pipeline": build_leaderboard_pipeline(month, department, limit),
+                "cursor": {},
+            }
+        }
+    else:  # department_trend
+        department = require("department", department)
+        range_from = require("from", range_from)
+        range_to = require("to", range_to)
+        for label, value in (("from", range_from), ("to", range_to)):
+            if not _is_iso_date(value):
+                raise HTTPException(status_code=422, detail=f"{label} must be a YYYY-MM-DD date")
+        if range_to < range_from:
+            raise HTTPException(status_code=422, detail="to must not be before from")
+        if (date_cls.fromisoformat(range_to) - date_cls.fromisoformat(range_from)).days + 1 > 92:
+            raise HTTPException(status_code=422, detail="range must not exceed 92 days")
+        dept_employees = list(
+            employees_col.find({"department": department}, {"_id": 0, "emp_code": 1, "joined_on": 1})
+        )
+        if not dept_employees:
+            raise HTTPException(status_code=404, detail="department not found")
+        command = {
+            "explain": {
+                "aggregate": "attendance_logs",
+                "pipeline": build_trend_pipeline(department, range_from, range_to, dept_employees),
+                "cursor": {},
+            }
+        }
+
+    return {
+        "endpoint": endpoint,
+        "collection": EXPLAIN_COLLECTION[endpoint],
+        "explain": _explain_doc(_run_explain(command)),
+    }
